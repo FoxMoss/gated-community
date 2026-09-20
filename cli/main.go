@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -10,10 +13,11 @@ import (
 	"runtime"
 
 	"github.com/alecthomas/kong"
+	"github.com/spf13/viper"
 )
 
 // https://gist.github.com/sevkin/9798d67b2cb9d07cb05f89f14ba682f8
-func open_in_browser(url string) error {
+func OpenInBrowser(url string) error {
 	var cmd string
 	var args []string
 
@@ -28,6 +32,43 @@ func open_in_browser(url string) error {
 	}
 	args = append(args, url)
 	return exec.Command(cmd, args...).Start()
+}
+
+func GetInfo(accessKey string) (map[string]any, error) {
+	client := &http.Client{}
+
+	request, err := http.NewRequest(http.MethodGet, "http://localhost:8080/api/v1/get_info", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	request.Header.Add("Authorization", fmt.Sprintf("%v", accessKey))
+
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+
+	infoResponseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var decodedInfoResponse map[string]any
+
+	err = json.Unmarshal(infoResponseBody, &decodedInfoResponse)
+
+	if err != nil {
+		return nil, err
+	}
+
+	errorResponse, hasError := decodedInfoResponse["error_description"]
+
+	if hasError {
+		return nil, errors.New(errorResponse.(string))
+	}
+
+	return decodedInfoResponse, nil
 }
 
 type Context struct {
@@ -78,9 +119,27 @@ func (r *HCACmd) Run(ctx *Context) error {
 	stdinBuffer := []byte{0}
 	os.Stdin.Read(stdinBuffer)
 
-	open_in_browser("https://auth.hackclub.com/oauth/authorize?client_id=55e72dce07e7645a7d66e11a8b18a88d&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth&response_type=code&scope=openid+email+name+profile+birthdate+verification_status+slack_id+basic_info")
+	OpenInBrowser("https://auth.hackclub.com/oauth/authorize?client_id=55e72dce07e7645a7d66e11a8b18a88d&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth&response_type=code&scope=openid+email+name+profile+birthdate+verification_status+slack_id+basic_info")
 
 	println("Opened!")
+
+	return nil
+}
+
+type SetKeyCmd struct {
+	Key string `arg:"" name:"key" help:"User key to be stored for identification"`
+}
+
+func (r *SetKeyCmd) Run(ctx *Context) error {
+	info, err := GetInfo(r.Key)
+
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Hello %s! You have been authed with %s.\n", info["name"].(string), info["auth_type"].(string))
+
+	viper.Set("AuthKey", r.Key)
 
 	return nil
 }
@@ -88,10 +147,19 @@ func (r *HCACmd) Run(ctx *Context) error {
 var CLI struct {
 	Upload UploadCmd `cmd:"" help:"Upload bitstream to be run"`
 	Auth   HCACmd    `cmd:"" help:"Connect with Hack Club Auth"`
+	SetKey SetKeyCmd `cmd:"" help:"Store user key"`
 }
 
 func main() {
+	viper.SetConfigName("config")
+
+	viper.AddConfigPath("/etc/appname/")
+	viper.AddConfigPath("$HOME/.appname")
+	viper.AddConfigPath(".")
+
+	err := viper.ReadInConfig()
+
 	ctx := kong.Parse(&CLI)
-	err := ctx.Run(&Context{})
+	err = ctx.Run(&Context{})
 	ctx.FatalIfErrorf(err)
 }
