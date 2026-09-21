@@ -14,6 +14,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -134,6 +135,88 @@ CREATE TABLE "access_tokens" (
 	PRIMARY KEY("access_key")
 );`)
 
+	var upgrader = websocket.Upgrader{}
+
+	http.HandleFunc("/queue", func(w http.ResponseWriter, r *http.Request) {
+		type ErrorType struct {
+			ErrorDescription string `json:"error_description"`
+		}
+
+		authKey, hasAuthKey := r.Header["Authorization"]
+		if !hasAuthKey {
+			payload := ErrorType{
+				ErrorDescription: "must have Authorization header set"}
+			payloadStr, _ := json.Marshal(payload)
+
+			w.Write(payloadStr)
+			return
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			payload := ErrorType{
+				ErrorDescription: err.Error()}
+			payloadStr, _ := json.Marshal(payload)
+
+			w.Write(payloadStr)
+			return
+		}
+
+		stmt, err := tx.Prepare(`SELECT access_key, auth_type, name, time_created FROM "access_tokens" WHERE access_key = ?`)
+		if err != nil {
+			payload := ErrorType{
+				ErrorDescription: err.Error()}
+			payloadStr, _ := json.Marshal(payload)
+
+			w.Write(payloadStr)
+			return
+		}
+
+		defer stmt.Close()
+
+		row := stmt.QueryRow(authKey[0])
+
+		type InfoType struct {
+			AccessKey   string `json:"access_key"`
+			AuthType    string `json:"auth_type"`
+			Name        string `json:"name"`
+			TimeCreated int    `json:"time_created"`
+		}
+
+		var returnInfo InfoType
+
+		err = row.Scan(&returnInfo.AccessKey, &returnInfo.AuthType, &returnInfo.Name, &returnInfo.TimeCreated)
+
+		if err != nil {
+			payload := ErrorType{
+				ErrorDescription: err.Error()}
+			payloadStr, _ := json.Marshal(payload)
+
+			w.Write(payloadStr)
+			return
+		}
+
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Print("upgrade:", err)
+			return
+		}
+		defer c.Close()
+		for {
+			mt, message, err := c.ReadMessage()
+			if err != nil {
+				log.Println("read:", err)
+				break
+			}
+			log.Printf("recv: %s", message)
+			err = c.WriteMessage(mt, message)
+			if err != nil {
+				log.Println("write:", err)
+				break
+			}
+		}
+	})
+
 	http.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			fmt.Fprintf(w, "error: must be GET")
@@ -195,7 +278,7 @@ CREATE TABLE "access_tokens" (
 			return
 		}
 
-		fmt.Fprintf(w, "Run `gated-community setkey %q`", userIdSum)
+		fmt.Fprintf(w, "Run `gated-community set-key %q`", userIdSum)
 	})
 
 	http.HandleFunc("/api/v1/get_info", func(w http.ResponseWriter, r *http.Request) {

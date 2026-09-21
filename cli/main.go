@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log"
 	"net/http"
 	"os"
 
@@ -140,6 +142,33 @@ func (r *SetKeyCmd) Run(ctx *Context) error {
 	fmt.Printf("Hello %s! You have been authed with %s.\n", info["name"].(string), info["auth_type"].(string))
 
 	viper.Set("AuthKey", r.Key)
+	err = viper.WriteConfig()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type StatusCmd struct {
+}
+
+func (r *StatusCmd) Run(ctx *Context) error {
+
+	authKey := viper.GetString("AuthKey")
+
+	if authKey == "" {
+		fmt.Println("No auth key, run:\ngated-community auth")
+		return nil
+	}
+
+	info, err := GetInfo(authKey)
+
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Name: %s\nAuth: %s\n", info["name"].(string), info["auth_type"].(string))
 
 	return nil
 }
@@ -148,16 +177,36 @@ var CLI struct {
 	Upload UploadCmd `cmd:"" help:"Upload bitstream to be run"`
 	Auth   HCACmd    `cmd:"" help:"Connect with Hack Club Auth"`
 	SetKey SetKeyCmd `cmd:"" help:"Store user key"`
+	Status StatusCmd `cmd:"" help:"Check auth details"`
 }
 
 func main() {
 	viper.SetConfigName("config")
+	viper.SetConfigType("json")
 
-	viper.AddConfigPath("/etc/appname/")
-	viper.AddConfigPath("$HOME/.appname")
-	viper.AddConfigPath(".")
+	home, err := os.UserHomeDir()
 
-	err := viper.ReadInConfig()
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+
+	gatedPath := fmt.Sprintf("%v/.gated-community", home)
+	gatedConfigPath := fmt.Sprintf("%v/.gated-community/config", home)
+
+	viper.AddConfigPath(gatedPath)
+
+	os.MkdirAll(gatedPath, fs.ModeDir|fs.ModePerm)
+
+	err = viper.ReadInConfig()
+
+	if err != nil {
+		// couldn't read file so we need to make file
+		_, err = os.Create(gatedConfigPath)
+
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+	}
 
 	ctx := kong.Parse(&CLI)
 	err = ctx.Run(&Context{})
