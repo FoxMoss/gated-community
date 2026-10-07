@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,22 +13,20 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
+	"go.bug.st/serial"
 )
 
 func GetAccessToken(authCode string) (string, error) {
-	type OAuthToken struct {
-		ClientId     string `json:"client_id"`
-		ClientSecret string `json:"client_secret"`
-		RedirectUri  string `json:"redirect_uri"`
-		Code         string `json:"code"`
-		GrantType    string `json:"grant_type"`
-	}
-
 	payload := OAuthToken{
 		ClientId:     os.Getenv("CLIENT_ID"),
 		ClientSecret: os.Getenv("CLIENT_SECRET"),
@@ -137,38 +136,397 @@ CREATE TABLE "access_tokens" (
 
 	var upgrader = websocket.Upgrader{}
 
+	type QueuedInfo struct {
+		Id        string
+		Value     []byte
+		TimeAdded time.Time
+	}
+
+	type WebsocketState string
+	const (
+		WebsocketConnect    WebsocketState = "CONNECT"
+		WebsocketDisconnect WebsocketState = "DISCONNECT"
+	)
+
+	type WebsocketMessage struct {
+		Socket *websocket.Conn
+		State  WebsocketState
+	}
+
+	readyForQueue := atomic.Bool{}
+	readyForQueue.Store(true)
+
+	if err != nil {
+		fmt.Println("error: ", err.Error())
+	}
+
+	var activeConnection *websocket.Conn
+	activeConnectionMutex := sync.Mutex{}
+
+	mode := &serial.Mode{
+		BaudRate: 115200,
+	}
+
+	file, err := serial.Open("/dev/ttyUSB0", mode)
+	if err != nil {
+		fmt.Println("error: no serial over /dev/ttyUSB0")
+		return
+	}
+
+	go func() {
+		for {
+			// if err == nil {
+			// 	activeConnectionMutex.Lock()
+			// 	defer activeConnectionMutex.Unlock()
+			//
+			// 	if activeConnection != nil {
+			// 		errorMessage := ErrorType{
+			// 			Type:             "error",
+			// 			ErrorDescription: "fpga disconnected",
+			// 		}
+			//
+			// 		fmt.Println("error: fpga disconnected")
+			//
+			// 		errorMarshalled, err := json.Marshal(errorMessage)
+			// 		if err != nil {
+			// 			fmt.Println("error: ", err.Error())
+			// 			continue
+			// 		}
+			//
+			// 		err = activeConnection.WriteJSON(string(errorMarshalled))
+			// 	}
+			//
+			// 	file, err = serial.Open("/dev/ttyUSB0", mode)
+			// 	continue
+			// }
+
+			buffer := make([]byte, 1024)
+			for {
+				bufferLen, err := file.Read(buffer)
+
+				if err != nil {
+					errorMessage := ErrorType{
+						Type:             "error",
+						ErrorDescription: "cannot read fpga serial",
+					}
+
+					errorMarshalled, err := json.Marshal(errorMessage)
+					if err != nil {
+						fmt.Println("error:", err.Error())
+						continue
+					}
+
+					if activeConnection != nil {
+						activeConnectionMutex.Lock()
+						err = activeConnection.WriteJSON(string(errorMarshalled))
+						activeConnectionMutex.Unlock()
+					}
+
+					file, err = serial.Open("/dev/ttyUSB0", mode)
+					if err != nil {
+						fmt.Println("error: no serial over /dev/ttyUSB0")
+						return
+					}
+
+					time.Sleep(time.Second * 5)
+					break
+				}
+
+				returnArray := make([]int, bufferLen)
+				for item := 0; item < bufferLen; item++ {
+					returnArray[item] = int(buffer[item])
+				}
+
+				if activeConnection != nil {
+					transferMessage := TransferType{
+						Type: "egress",
+						Data: returnArray,
+					}
+
+					transferMarshalled, err := json.Marshal(transferMessage)
+					if err != nil {
+						fmt.Println("error: ", err.Error())
+						continue
+					}
+
+					activeConnectionMutex.Lock()
+					err = activeConnection.WriteJSON(string(transferMarshalled))
+					activeConnectionMutex.Unlock()
+				}
+
+			}
+		}
+	}()
+
+	activeChannel := make(chan WebsocketMessage, 0)
+	websocketChannel := make(chan WebsocketMessage, 10)
+	finishActiveConnection := make(chan bool, 0)
+
+	fileDB := map[*websocket.Conn][]byte{}
+	fileDBMutex := sync.Mutex{}
+
+	// active connection handler
+	go func() {
+		for {
+			println("waiting again")
+			activeMsg := <-activeChannel
+
+			activeConnectionMutex.Lock()
+			activeConnection = activeMsg.Socket
+			activeConnectionMutex.Unlock()
+
+			fileDBMutex.Lock()
+			bitstream := fileDB[activeMsg.Socket]
+			fileDBMutex.Unlock()
+
+			if bitstream == nil {
+				payload := ErrorType{
+					Type:             "error",
+					ErrorDescription: "no bitstream file"}
+
+				payloadStr, err := json.Marshal(payload)
+				if err != nil {
+					activeMsg.Socket.WriteJSON(string(payloadStr))
+				}
+			} else {
+				bitstreamFd, err := os.OpenFile("file.bit", os.O_CREATE|os.O_RDWR, os.ModePerm)
+				bitstreamFd.Write(bitstream)
+				bitstreamFd.Close()
+
+				cmd := exec.Command("openFPGALoader", "-b", "icepi-zero", "file.bit")
+
+				println("cmd")
+				outMsg, err := cmd.CombinedOutput()
+				println("cmd end")
+				var skipToClose bool = false
+
+				if err != nil {
+					payload := ErrorType{
+						Type:             "error",
+						ErrorDescription: string(outMsg)}
+
+					println("sending error")
+					payloadStr, err := json.Marshal(payload)
+					if err == nil {
+						activeMsg.Socket.WriteJSON(string(payloadStr))
+					}
+
+					skipToClose = true
+				}
+
+				if !skipToClose {
+
+					for {
+						readStructureStr := ""
+
+						println("reading")
+						err = activeMsg.Socket.ReadJSON(&readStructureStr)
+						if err != nil {
+							println("error reading")
+							break
+						}
+
+						readStructure := map[string]any{}
+
+						err = json.Unmarshal([]byte(readStructureStr), &readStructure)
+						if err != nil {
+							payload := ErrorType{
+								Type:             "error",
+								ErrorDescription: "unmarshal error on servers fault"}
+
+							payloadStr, err := json.Marshal(payload)
+							if err != nil {
+								activeMsg.Socket.WriteJSON(string(payloadStr))
+							}
+							break
+						}
+
+						data, hasData := readStructure["data"]
+						if !hasData {
+							fmt.Println("error: error parsing data, with unknown error")
+							break
+						}
+
+						dataBytes := make([]byte, len(data.([]any)))
+						for item := 0; item < len(data.([]any)); item++ {
+							dataBytes[item] = byte(data.([]any)[item].(float64))
+						}
+
+						_, err = file.Write(dataBytes)
+						if err != nil {
+							println(err.Error())
+						}
+					}
+				}
+			}
+
+			println("ended")
+			finishActiveConnection <- true
+		}
+	}()
+
+	timerExpired := atomic.Bool{}
+	timerExpired.Store(false)
+
+	// queue handler
+	go func() {
+		websocketQueue := []*websocket.Conn{}
+		websocketStatuses := map[*websocket.Conn]bool{}
+
+		lockoutTimer := time.NewTimer(time.Second * 5)
+		lockoutTimer.Stop()
+
+		var connectedCount uint64 = 0
+		for {
+
+			println("waiting again connection")
+			select {
+			case _ = <-finishActiveConnection:
+				println("removing connection")
+				lockoutTimer.Stop()
+
+				readyForQueue.Store(true)
+
+				println("waiting on lock")
+				activeConnectionMutex.Lock()
+
+				if activeConnection != nil {
+					activeConnection.Close()
+				}
+
+				websocketChannel <- WebsocketMessage{Socket: activeConnection, State: WebsocketDisconnect}
+
+				activeConnection = nil
+				activeConnectionMutex.Unlock()
+				println("unlocked unlocked")
+			case _ = <-lockoutTimer.C:
+				println("debug: timer expired!")
+
+				if readyForQueue.Load() {
+					continue
+				}
+
+				if len(websocketQueue) <= 1 {
+					finishActiveConnection <- true
+					continue
+				}
+
+				// we need to kill it if somone new joins
+				timerExpired.Store(true)
+			case websocketUpdate := <-websocketChannel:
+				println("new update msg")
+				switch websocketUpdate.State {
+				case WebsocketConnect:
+					websocketStatuses[websocketUpdate.Socket] = true
+					websocketQueue = append(websocketQueue, websocketUpdate.Socket)
+
+					connectedCount++
+				case WebsocketDisconnect:
+					connectedCount--
+
+					removeIndex := slices.IndexFunc(websocketQueue, func(conn *websocket.Conn) bool { return websocketUpdate.Socket == conn })
+					if removeIndex != -1 {
+						websocketQueue = append(websocketQueue[:removeIndex], websocketQueue[removeIndex+1:]...)
+						delete(websocketStatuses, websocketUpdate.Socket)
+					}
+				}
+
+				var first *websocket.Conn = nil
+				if len(websocketQueue) != 0 {
+					first = websocketQueue[0]
+				}
+
+				for connection := range websocketStatuses {
+					broadcastMessage := QueueBroadcastType{
+						Type:             "queue_broadcast",
+						ConnectedClients: connectedCount,
+						IsProccessing:    connection == first,
+					}
+
+					broadcastMarshalled, err := json.Marshal(broadcastMessage)
+					if err != nil {
+						fmt.Println("error: ", err.Error())
+						continue
+					}
+					err = connection.WriteJSON(string(broadcastMarshalled))
+
+					if err != nil {
+						connection.Close()
+
+						websocketChannel <- WebsocketMessage{Socket: connection, State: WebsocketDisconnect}
+						continue
+					}
+				}
+
+				if timerExpired.Load() && len(websocketQueue) > 1 && !readyForQueue.Load() {
+					timerExpired.Store(false)
+					finishActiveConnection <- true
+				}
+
+				if readyForQueue.Load() && len(websocketStatuses) != 0 {
+					activeChannel <- WebsocketMessage{Socket: first, State: WebsocketConnect}
+					readyForQueue.Store(false)
+
+					lockoutTimer.Reset(time.Second * 5)
+					println("debug: started timer")
+				}
+			}
+		}
+
+		for connection := range websocketStatuses {
+			connection.Close()
+		}
+	}()
+
 	http.HandleFunc("/queue", func(w http.ResponseWriter, r *http.Request) {
-		type ErrorType struct {
-			ErrorDescription string `json:"error_description"`
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Print("upgrade:", err)
+			return
 		}
 
 		authKey, hasAuthKey := r.Header["Authorization"]
 		if !hasAuthKey {
 			payload := ErrorType{
+				Type:             "error",
 				ErrorDescription: "must have Authorization header set"}
-			payloadStr, _ := json.Marshal(payload)
 
-			w.Write(payloadStr)
+			payloadStr, err := json.Marshal(payload)
+			if err != nil {
+				c.WriteJSON(string(payloadStr))
+			}
+
+			c.Close()
 			return
 		}
 
 		tx, err := db.Begin()
 		if err != nil {
 			payload := ErrorType{
+				Type:             "error",
 				ErrorDescription: err.Error()}
-			payloadStr, _ := json.Marshal(payload)
 
-			w.Write(payloadStr)
+			payloadStr, err := json.Marshal(payload)
+			if err != nil {
+				c.WriteJSON(string(payloadStr))
+			}
+
+			c.Close()
 			return
 		}
 
 		stmt, err := tx.Prepare(`SELECT access_key, auth_type, name, time_created FROM "access_tokens" WHERE access_key = ?`)
 		if err != nil {
 			payload := ErrorType{
+				Type:             "error",
 				ErrorDescription: err.Error()}
-			payloadStr, _ := json.Marshal(payload)
 
-			w.Write(payloadStr)
+			payloadStr, err := json.Marshal(payload)
+			if err != nil {
+				c.WriteJSON(string(payloadStr))
+			}
+
+			c.Close()
 			return
 		}
 
@@ -176,45 +534,121 @@ CREATE TABLE "access_tokens" (
 
 		row := stmt.QueryRow(authKey[0])
 
-		type InfoType struct {
-			AccessKey   string `json:"access_key"`
-			AuthType    string `json:"auth_type"`
-			Name        string `json:"name"`
-			TimeCreated int    `json:"time_created"`
-		}
-
 		var returnInfo InfoType
 
 		err = row.Scan(&returnInfo.AccessKey, &returnInfo.AuthType, &returnInfo.Name, &returnInfo.TimeCreated)
 
 		if err != nil {
 			payload := ErrorType{
+				Type:             "error",
 				ErrorDescription: err.Error()}
-			payloadStr, _ := json.Marshal(payload)
 
-			w.Write(payloadStr)
+			payloadStr, err := json.Marshal(payload)
+			if err != nil {
+				c.WriteJSON(string(payloadStr))
+			}
+
+			c.Close()
 			return
 		}
 
-		c, err := upgrader.Upgrade(w, r, nil)
+		err = c.WriteJSON(`{"type": "connected"}`)
 		if err != nil {
-			log.Print("upgrade:", err)
 			return
 		}
-		defer c.Close()
-		for {
-			mt, message, err := c.ReadMessage()
-			if err != nil {
-				log.Println("read:", err)
-				break
-			}
-			log.Printf("recv: %s", message)
-			err = c.WriteMessage(mt, message)
-			if err != nil {
-				log.Println("write:", err)
-				break
-			}
+
+		readStructureStr := ""
+		err = c.ReadJSON(&readStructureStr)
+		if err != nil {
+			return
 		}
+
+		readStructure := map[string]any{}
+
+		err = json.Unmarshal([]byte(readStructureStr), &readStructure)
+		if err != nil {
+			payload := ErrorType{
+				Type:             "error",
+				ErrorDescription: "unmarshal error on servers fault"}
+
+			payloadStr, err := json.Marshal(payload)
+			if err != nil {
+				c.WriteJSON(string(payloadStr))
+			}
+
+			c.Close()
+			return
+		}
+
+		messageType, hasType := readStructure["type"]
+		if !hasType {
+			payload := ErrorType{
+				Type:             "error",
+				ErrorDescription: "type parsing error, server sent invalid packet"}
+
+			c.WriteJSON(payload)
+			c.Close()
+			return
+		}
+
+		if messageType != "upload" {
+			payload := ErrorType{
+				Type:             "error",
+				ErrorDescription: "first packet must be error"}
+
+			payloadStr, err := json.Marshal(payload)
+			if err != nil {
+				c.WriteJSON(string(payloadStr))
+			}
+
+			c.Close()
+			return
+		}
+
+		messageFile, hasFile := readStructure["file"]
+		if !hasFile {
+			payload := ErrorType{
+				Type:             "error",
+				ErrorDescription: "you must upload a file"}
+
+			payloadStr, err := json.Marshal(payload)
+			if err != nil {
+				c.WriteJSON(string(payloadStr))
+			}
+
+			c.Close()
+			return
+		}
+
+		if len(messageFile.(string)) > 1000000 /* 1mb */ {
+			payload := ErrorType{
+				Type:             "error",
+				ErrorDescription: "file content must be smaller than 1mb"}
+
+			payloadStr, err := json.Marshal(payload)
+			if err != nil {
+				c.WriteJSON(string(payloadStr))
+			}
+
+			c.Close()
+			return
+		}
+
+		messageFileReader := strings.NewReader(messageFile.(string))
+
+		fileParsedReader := base64.NewDecoder(base64.RawStdEncoding, messageFileReader)
+		fileParsed, err := io.ReadAll(fileParsedReader)
+
+		fileDBMutex.Lock()
+
+		fileDB[c] = fileParsed
+
+		fileDBMutex.Unlock()
+
+		// ownership gets passed to the queue
+		websocketChannel <- WebsocketMessage{Socket: c, State: WebsocketConnect}
+		//
+		// websocketChanel <- WebsocketMessage{Socket: c, State: WebsocketDisconnect}
 	})
 
 	http.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
@@ -330,13 +764,6 @@ CREATE TABLE "access_tokens" (
 		defer stmt.Close()
 
 		row := stmt.QueryRow(authKey[0])
-
-		type InfoType struct {
-			AccessKey   string `json:"access_key"`
-			AuthType    string `json:"auth_type"`
-			Name        string `json:"name"`
-			TimeCreated int    `json:"time_created"`
-		}
 
 		var returnInfo InfoType
 

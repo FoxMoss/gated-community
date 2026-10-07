@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,13 +8,19 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 
 	"os/exec"
 	"runtime"
 
 	"github.com/alecthomas/kong"
+	"github.com/creack/pty"
+	"github.com/gorilla/websocket"
 	"github.com/spf13/viper"
+
+	tea "charm.land/bubbletea/v2"
+	lipgloss "charm.land/lipgloss/v2"
 )
 
 // https://gist.github.com/sevkin/9798d67b2cb9d07cb05f89f14ba682f8
@@ -81,33 +86,156 @@ type UploadCmd struct {
 }
 
 func (r *UploadCmd) Run(ctx *Context) error {
-	fileDescriptor, err := os.Open(r.Path)
+	authKey := viper.GetString("AuthKey")
+
+	if authKey == "" {
+		fmt.Println("No auth key, run:\ngated-community auth")
+		return nil
+	}
+
+	fileBuffer, err := os.ReadFile(r.Path)
 
 	if err != nil {
 		return err
 	}
 
-	reader := bufio.NewReader(fileDescriptor)
+	url := url.URL{Scheme: "ws", Host: "127.0.0.1:8080", Path: "/queue"}
 
-	req, err := http.NewRequest(http.MethodPost, "http://0.0.0.0:8080/upload_bitstream", reader)
+	requestHeader := http.Header{}
+	requestHeader.Add("Authorization", fmt.Sprintf("%v", authKey))
+
+	c, _, err := websocket.DefaultDialer.Dial(url.String(), requestHeader)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer c.Close()
+
+	type UploadType struct {
+		Type string `json:"type"`
+		File []byte `json:"file"`
+	}
+
+	fileUpload := UploadType{
+		Type: "upload",
+		File: fileBuffer,
+	}
+
+	uploadBuffer, err := json.Marshal(fileUpload)
+
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/octet-stream")
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		panic(err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
+	err = c.WriteJSON(string(uploadBuffer))
 
 	if err != nil {
 		return err
 	}
 
-	println(string(respBody))
+	term, tty, err := pty.Open()
+	if err != nil {
+		fmt.Println("error: tty error,", err.Error())
+		return err
+	}
+
+	fmt.Println(tty.Name())
+
+	go func() {
+		buffer := make([]byte, 1024)
+		for {
+			bufferLen, err := term.Read(buffer)
+
+			if err != nil {
+				println(err.Error())
+				break
+			}
+
+			returnArray := make([]int, bufferLen)
+			for item := 0; item < bufferLen; item++ {
+				returnArray[item] = int(buffer[item])
+			}
+
+			type TransferType struct {
+				Type string `json:"type"`
+				Data []int  `json:"data"`
+			}
+
+			transferMessage := TransferType{
+				Type: "ingress",
+				Data: returnArray,
+			}
+
+			transferMarshalled, err := json.Marshal(transferMessage)
+
+			if err != nil {
+				fmt.Println("error: ", err.Error())
+				continue
+			}
+
+			err = c.WriteJSON(string(transferMarshalled))
+
+			if err != nil {
+				break
+			}
+
+		}
+	}()
+
+	for {
+		readStructureStr := ""
+		err = c.ReadJSON(&readStructureStr)
+
+		if err != nil {
+			fmt.Println("error: read json error,", err.Error())
+			break
+		}
+
+		readStructure := map[string]any{}
+
+		err = json.Unmarshal([]byte(readStructureStr), &readStructure)
+		if err != nil {
+			fmt.Println("error: unmarshal error,", err.Error())
+			break
+		}
+
+		messageType, hasType := readStructure["type"]
+		if !hasType {
+			fmt.Println("error: type parsing error, server sent invalid packet")
+			break
+		}
+
+		switch messageType {
+		case "error":
+			errorDescription, hasDescription := readStructure["error_description"]
+			if hasDescription {
+				fmt.Println("error: from server,", errorDescription, "\n")
+				break
+			} else {
+				fmt.Println("error: error parsing error, with unknown error")
+				break
+			}
+		case "egress":
+			data, hasData := readStructure["data"]
+			if !hasData {
+				fmt.Println("error: error parsing data, with unknown error")
+				break
+			}
+
+			dataBytes := make([]byte, len(data.([]any)))
+			for item := 0; item < len(data.([]any)); item++ {
+				dataBytes[item] = byte(data.([]any)[item].(float64))
+			}
+
+			_, err = term.Write(dataBytes)
+			if err != nil {
+				println(err.Error())
+			}
+
+		default:
+			println(readStructureStr)
+		}
+	}
 
 	return nil
 }
@@ -154,7 +282,6 @@ type StatusCmd struct {
 }
 
 func (r *StatusCmd) Run(ctx *Context) error {
-
 	authKey := viper.GetString("AuthKey")
 
 	if authKey == "" {
