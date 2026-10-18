@@ -167,11 +167,7 @@ CREATE TABLE "access_tokens" (
 		BaudRate: 115200,
 	}
 
-	file, err := serial.Open("/dev/ttyUSB0", mode)
-	if err != nil {
-		fmt.Println("error: no serial over /dev/ttyUSB0")
-		return
-	}
+	serialStream := make(chan serial.Port)
 
 	go func() {
 		for {
@@ -200,6 +196,8 @@ CREATE TABLE "access_tokens" (
 			// 	continue
 			// }
 
+			file := <-serialStream
+
 			buffer := make([]byte, 1024)
 			for {
 				bufferLen, err := file.Read(buffer)
@@ -222,13 +220,6 @@ CREATE TABLE "access_tokens" (
 						activeConnectionMutex.Unlock()
 					}
 
-					file, err = serial.Open("/dev/ttyUSB0", mode)
-					if err != nil {
-						fmt.Println("error: no serial over /dev/ttyUSB0")
-						return
-					}
-
-					time.Sleep(time.Second * 5)
 					break
 				}
 
@@ -316,6 +307,13 @@ CREATE TABLE "access_tokens" (
 
 				if !skipToClose {
 
+					file, err := serial.Open("/dev/ttyUSB0", mode)
+					if err != nil {
+						fmt.Println("error: no serial over /dev/ttyUSB0")
+						continue
+					}
+					serialStream <- file
+
 					for {
 						readStructureStr := ""
 
@@ -373,7 +371,7 @@ CREATE TABLE "access_tokens" (
 		websocketQueue := []*websocket.Conn{}
 		websocketStatuses := map[*websocket.Conn]bool{}
 
-		lockoutTimer := time.NewTimer(time.Second * 5)
+		lockoutTimer := time.NewTimer(time.Second * 60 * 5)
 		lockoutTimer.Stop()
 
 		var connectedCount uint64 = 0
@@ -467,7 +465,7 @@ CREATE TABLE "access_tokens" (
 					activeChannel <- WebsocketMessage{Socket: first, State: WebsocketConnect}
 					readyForQueue.Store(false)
 
-					lockoutTimer.Reset(time.Second * 5)
+					lockoutTimer.Reset(time.Second * 60 * 5)
 					println("debug: started timer")
 				}
 			}

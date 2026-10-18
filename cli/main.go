@@ -20,7 +20,7 @@ import (
 	"github.com/spf13/viper"
 
 	tea "charm.land/bubbletea/v2"
-	lipgloss "charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // https://gist.github.com/sevkin/9798d67b2cb9d07cb05f89f14ba682f8
@@ -85,14 +85,62 @@ type UploadCmd struct {
 	Path string `arg:"" name:"path" help:"Paths to remove." type:"path"`
 }
 
-func (r *UploadCmd) Run(ctx *Context) error {
-	authKey := viper.GetString("AuthKey")
+type UIState struct {
+	status       string
+	errorMessage string
+}
 
-	if authKey == "" {
-		fmt.Println("No auth key, run:\ngated-community auth")
-		return nil
+type model struct {
+	stateChan    chan UIState
+	currentState UIState
+}
+
+func (m model) listenForUpdate() tea.Cmd {
+	return func() tea.Msg {
+		msg := <-m.stateChan
+		return msg
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return m.listenForUpdate()
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyPressMsg:
+
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		}
+
+	case UIState:
+		m.currentState = msg
+		return m, m.listenForUpdate()
 	}
 
+	return m, nil
+}
+
+func (m model) View() tea.View {
+	border := lipgloss.NewStyle().Border(lipgloss.Border{
+		Top:         "-",
+		Bottom:      "-",
+		Left:        "|",
+		Right:       "|",
+		TopLeft:     "/",
+		TopRight:    "\\",
+		BottomLeft:  "\\",
+		BottomRight: "//",
+	}).Padding(0).Align(lipgloss.Center)
+
+	s := lipgloss.Sprintf(border.Render(m.currentState.errorMessage))
+
+	return tea.NewView(s)
+}
+
+func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 	fileBuffer, err := os.ReadFile(r.Path)
 
 	if err != nil {
@@ -133,13 +181,13 @@ func (r *UploadCmd) Run(ctx *Context) error {
 		return err
 	}
 
-	term, tty, err := pty.Open()
+	term, _, err := pty.Open()
 	if err != nil {
-		fmt.Println("error: tty error,", err.Error())
+		// fmt.Println("error: tty error,", err.Error())
 		return err
 	}
 
-	fmt.Println(tty.Name())
+	// fmt.Println(tty.Name())
 
 	go func() {
 		buffer := make([]byte, 1024)
@@ -147,7 +195,7 @@ func (r *UploadCmd) Run(ctx *Context) error {
 			bufferLen, err := term.Read(buffer)
 
 			if err != nil {
-				println(err.Error())
+				// println(err.Error())
 				break
 			}
 
@@ -169,7 +217,7 @@ func (r *UploadCmd) Run(ctx *Context) error {
 			transferMarshalled, err := json.Marshal(transferMessage)
 
 			if err != nil {
-				fmt.Println("error: ", err.Error())
+				// fmt.Println("error: ", err.Error())
 				continue
 			}
 
@@ -187,7 +235,7 @@ func (r *UploadCmd) Run(ctx *Context) error {
 		err = c.ReadJSON(&readStructureStr)
 
 		if err != nil {
-			fmt.Println("error: read json error,", err.Error())
+			// fmt.Println("error: read json error,", err.Error())
 			break
 		}
 
@@ -195,13 +243,13 @@ func (r *UploadCmd) Run(ctx *Context) error {
 
 		err = json.Unmarshal([]byte(readStructureStr), &readStructure)
 		if err != nil {
-			fmt.Println("error: unmarshal error,", err.Error())
+			// fmt.Println("error: unmarshal error,", err.Error())
 			break
 		}
 
 		messageType, hasType := readStructure["type"]
 		if !hasType {
-			fmt.Println("error: type parsing error, server sent invalid packet")
+			// fmt.Println("error: type parsing error, server sent invalid packet")
 			break
 		}
 
@@ -209,16 +257,16 @@ func (r *UploadCmd) Run(ctx *Context) error {
 		case "error":
 			errorDescription, hasDescription := readStructure["error_description"]
 			if hasDescription {
-				fmt.Println("error: from server,", errorDescription, "\n")
+				m.stateChan <- UIState{status: "error", errorMessage: errorDescription.(string)}
 				break
 			} else {
-				fmt.Println("error: error parsing error, with unknown error")
+				// fmt.Println("error: error parsing error, with unknown error")
 				break
 			}
 		case "egress":
 			data, hasData := readStructure["data"]
 			if !hasData {
-				fmt.Println("error: error parsing data, with unknown error")
+				// fmt.Println("error: error parsing data, with unknown error")
 				break
 			}
 
@@ -229,12 +277,36 @@ func (r *UploadCmd) Run(ctx *Context) error {
 
 			_, err = term.Write(dataBytes)
 			if err != nil {
-				println(err.Error())
+				// println(err.Error())
 			}
 
 		default:
-			println(readStructureStr)
+			// println(readStructureStr)
 		}
+	}
+
+	return nil
+}
+
+func (r *UploadCmd) Run(ctx *Context) error {
+	authKey := viper.GetString("AuthKey")
+
+	if authKey == "" {
+		fmt.Println("No auth key, run:\ngated-community auth")
+		return nil
+	}
+
+	m := model{}
+
+	m.stateChan = make(chan UIState)
+
+	p := tea.NewProgram(m)
+
+	go m.QueueConnection(r, authKey)
+
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("error: %v", err)
+		os.Exit(1)
 	}
 
 	return nil
