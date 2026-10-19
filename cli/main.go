@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"time"
 
 	"os/exec"
 	"runtime"
@@ -20,7 +21,6 @@ import (
 	"github.com/spf13/viper"
 
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 )
 
 // https://gist.github.com/sevkin/9798d67b2cb9d07cb05f89f14ba682f8
@@ -88,56 +88,7 @@ type UploadCmd struct {
 type UIState struct {
 	status       string
 	errorMessage string
-}
-
-type model struct {
-	stateChan    chan UIState
-	currentState UIState
-}
-
-func (m model) listenForUpdate() tea.Cmd {
-	return func() tea.Msg {
-		msg := <-m.stateChan
-		return msg
-	}
-}
-
-func (m model) Init() tea.Cmd {
-	return m.listenForUpdate()
-}
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyPressMsg:
-
-		switch msg.String() {
-		case "ctrl+c", "q":
-			return m, tea.Quit
-		}
-
-	case UIState:
-		m.currentState = msg
-		return m, m.listenForUpdate()
-	}
-
-	return m, nil
-}
-
-func (m model) View() tea.View {
-	border := lipgloss.NewStyle().Border(lipgloss.Border{
-		Top:         "-",
-		Bottom:      "-",
-		Left:        "|",
-		Right:       "|",
-		TopLeft:     "/",
-		TopRight:    "\\",
-		BottomLeft:  "\\",
-		BottomRight: "//",
-	}).Padding(0).Align(lipgloss.Center)
-
-	s := lipgloss.Sprintf(border.Render(m.currentState.errorMessage))
-
-	return tea.NewView(s)
+	ptyName      string
 }
 
 func (m model) QueueConnection(r *UploadCmd, authKey string) error {
@@ -183,11 +134,14 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 
 	term, _, err := pty.Open()
 	if err != nil {
-		// fmt.Println("error: tty error,", err.Error())
+		m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
 		return err
 	}
 
-	// fmt.Println(tty.Name())
+	defer term.Close()
+
+	// don't timeout
+	term.SetDeadline(time.Time{})
 
 	go func() {
 		buffer := make([]byte, 1024)
@@ -195,7 +149,7 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 			bufferLen, err := term.Read(buffer)
 
 			if err != nil {
-				// println(err.Error())
+				m.stateChan <- UIState{status: "error", errorMessage: "error reading pty\n" + err.Error()}
 				break
 			}
 
@@ -217,7 +171,7 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 			transferMarshalled, err := json.Marshal(transferMessage)
 
 			if err != nil {
-				// fmt.Println("error: ", err.Error())
+				m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
 				continue
 			}
 
@@ -232,10 +186,11 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 
 	for {
 		readStructureStr := ""
+
 		err = c.ReadJSON(&readStructureStr)
 
 		if err != nil {
-			// fmt.Println("error: read json error,", err.Error())
+			m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
 			break
 		}
 
@@ -243,30 +198,36 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 
 		err = json.Unmarshal([]byte(readStructureStr), &readStructure)
 		if err != nil {
-			// fmt.Println("error: unmarshal error,", err.Error())
+			m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
 			break
 		}
 
 		messageType, hasType := readStructure["type"]
 		if !hasType {
-			// fmt.Println("error: type parsing error, server sent invalid packet")
+			m.stateChan <- UIState{status: "error", errorMessage: "type parsing error, server sent invalid packet"}
 			break
 		}
 
 		switch messageType {
 		case "error":
-			errorDescription, hasDescription := readStructure["error_description"]
+			errorDescription, hasDescription := readStructure["description"]
 			if hasDescription {
 				m.stateChan <- UIState{status: "error", errorMessage: errorDescription.(string)}
 				break
 			} else {
-				// fmt.Println("error: error parsing error, with unknown error")
+				m.stateChan <- UIState{status: "error", errorMessage: "undeclared error from server"}
+				break
+			}
+		case "status":
+			description, hasDescription := readStructure["description"]
+			if hasDescription {
+				m.stateChan <- UIState{status: description.(string), ptyName: term.Name()}
 				break
 			}
 		case "egress":
 			data, hasData := readStructure["data"]
 			if !hasData {
-				// fmt.Println("error: error parsing data, with unknown error")
+				m.stateChan <- UIState{status: "error", errorMessage: "parsing webscoket serial data failed"}
 				break
 			}
 
@@ -277,11 +238,10 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 
 			_, err = term.Write(dataBytes)
 			if err != nil {
-				// println(err.Error())
+				m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
 			}
 
 		default:
-			// println(readStructureStr)
 		}
 	}
 

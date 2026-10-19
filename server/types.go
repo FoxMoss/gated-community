@@ -17,9 +17,9 @@ type InfoType struct {
 	TimeCreated int    `json:"time_created"`
 }
 
-type ErrorType struct {
-	Type             string `json:"type"`
-	ErrorDescription string `json:"error_description"`
+type UpdateType struct {
+	Type        string `json:"type"`
+	Description string `json:"description"`
 }
 
 type QueueBroadcastType struct {

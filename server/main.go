@@ -26,6 +26,19 @@ import (
 	"go.bug.st/serial"
 )
 
+func getTTY(mode *serial.Mode) (serial.Port, error) {
+	for i := 0; i < 10; i++ {
+		nameTTY := fmt.Sprintf("/dev/ttyUSB%v", i)
+
+		file, err := serial.Open(nameTTY, mode)
+		if err != nil {
+			continue
+		}
+		return file, nil
+	}
+	return nil, errors.New("cannot open FPGA uart")
+}
+
 func GetAccessToken(authCode string) (string, error) {
 	payload := OAuthToken{
 		ClientId:     os.Getenv("CLIENT_ID"),
@@ -171,30 +184,6 @@ CREATE TABLE "access_tokens" (
 
 	go func() {
 		for {
-			// if err == nil {
-			// 	activeConnectionMutex.Lock()
-			// 	defer activeConnectionMutex.Unlock()
-			//
-			// 	if activeConnection != nil {
-			// 		errorMessage := ErrorType{
-			// 			Type:             "error",
-			// 			ErrorDescription: "fpga disconnected",
-			// 		}
-			//
-			// 		fmt.Println("error: fpga disconnected")
-			//
-			// 		errorMarshalled, err := json.Marshal(errorMessage)
-			// 		if err != nil {
-			// 			fmt.Println("error: ", err.Error())
-			// 			continue
-			// 		}
-			//
-			// 		err = activeConnection.WriteJSON(string(errorMarshalled))
-			// 	}
-			//
-			// 	file, err = serial.Open("/dev/ttyUSB0", mode)
-			// 	continue
-			// }
 
 			file := <-serialStream
 
@@ -203,9 +192,9 @@ CREATE TABLE "access_tokens" (
 				bufferLen, err := file.Read(buffer)
 
 				if err != nil {
-					errorMessage := ErrorType{
-						Type:             "error",
-						ErrorDescription: "cannot read fpga serial",
+					errorMessage := UpdateType{
+						Type:        "warn",
+						Description: "cannot read fpga serial",
 					}
 
 					errorMarshalled, err := json.Marshal(errorMessage)
@@ -271,89 +260,113 @@ CREATE TABLE "access_tokens" (
 			fileDBMutex.Unlock()
 
 			if bitstream == nil {
-				payload := ErrorType{
-					Type:             "error",
-					ErrorDescription: "no bitstream file"}
+				payload := UpdateType{
+					Type:        "error",
+					Description: "no bitstream file"}
 
 				payloadStr, err := json.Marshal(payload)
 				if err != nil {
 					activeMsg.Socket.WriteJSON(string(payloadStr))
 				}
 			} else {
+				{
+					payload := UpdateType{
+						Type:        "status",
+						Description: "flashing"}
+					payloadStr, err := json.Marshal(payload)
+					if err == nil {
+						activeMsg.Socket.WriteJSON(string(payloadStr))
+					}
+				}
+
 				bitstreamFd, err := os.OpenFile("file.bit", os.O_CREATE|os.O_RDWR, os.ModePerm)
 				bitstreamFd.Write(bitstream)
 				bitstreamFd.Close()
 
 				cmd := exec.Command("openFPGALoader", "-b", "icepi-zero", "file.bit")
 
-				println("cmd")
 				outMsg, err := cmd.CombinedOutput()
-				println("cmd end")
-				var skipToClose bool = false
 
 				if err != nil {
-					payload := ErrorType{
-						Type:             "error",
-						ErrorDescription: string(outMsg)}
+					payload := UpdateType{
+						Type:        "error",
+						Description: string(outMsg)}
 
-					println("sending error")
 					payloadStr, err := json.Marshal(payload)
 					if err == nil {
 						activeMsg.Socket.WriteJSON(string(payloadStr))
 					}
 
-					skipToClose = true
+					finishActiveConnection <- true
 				}
 
-				if !skipToClose {
-
-					file, err := serial.Open("/dev/ttyUSB0", mode)
-					if err != nil {
-						fmt.Println("error: no serial over /dev/ttyUSB0")
-						continue
+				{
+					payload := UpdateType{
+						Type:        "status",
+						Description: "flashSuccess"}
+					payloadStr, err := json.Marshal(payload)
+					if err == nil {
+						activeMsg.Socket.WriteJSON(string(payloadStr))
 					}
-					serialStream <- file
+				}
 
-					for {
-						readStructureStr := ""
+				file, err := getTTY(mode)
+				defer file.Close()
+				if err != nil {
+					payload := UpdateType{
+						Type:        "error",
+						Description: string("no serial found for uart")}
 
-						println("reading")
-						err = activeMsg.Socket.ReadJSON(&readStructureStr)
+					payloadStr, err := json.Marshal(payload)
+					if err == nil {
+						activeMsg.Socket.WriteJSON(string(payloadStr))
+					}
+
+					finishActiveConnection <- true
+					continue
+				}
+
+				serialStream <- file
+
+				for {
+					readStructureStr := ""
+
+					println("reading")
+					err = activeMsg.Socket.ReadJSON(&readStructureStr)
+					if err != nil {
+						println("error reading")
+						break
+					}
+
+					readStructure := map[string]any{}
+
+					err = json.Unmarshal([]byte(readStructureStr), &readStructure)
+					if err != nil {
+						payload := UpdateType{
+							Type:        "error",
+							Description: "unmarshal error on servers fault"}
+
+						payloadStr, err := json.Marshal(payload)
 						if err != nil {
-							println("error reading")
-							break
+							activeMsg.Socket.WriteJSON(string(payloadStr))
 						}
+						break
+					}
 
-						readStructure := map[string]any{}
+					data, hasData := readStructure["data"]
+					if !hasData {
+						fmt.Println("error: error parsing data, with unknown error")
+						break
+					}
 
-						err = json.Unmarshal([]byte(readStructureStr), &readStructure)
-						if err != nil {
-							payload := ErrorType{
-								Type:             "error",
-								ErrorDescription: "unmarshal error on servers fault"}
+					dataBytes := make([]byte, len(data.([]any)))
+					for item := 0; item < len(data.([]any)); item++ {
+						dataBytes[item] = byte(data.([]any)[item].(float64))
+					}
 
-							payloadStr, err := json.Marshal(payload)
-							if err != nil {
-								activeMsg.Socket.WriteJSON(string(payloadStr))
-							}
-							break
-						}
-
-						data, hasData := readStructure["data"]
-						if !hasData {
-							fmt.Println("error: error parsing data, with unknown error")
-							break
-						}
-
-						dataBytes := make([]byte, len(data.([]any)))
-						for item := 0; item < len(data.([]any)); item++ {
-							dataBytes[item] = byte(data.([]any)[item].(float64))
-						}
-
-						_, err = file.Write(dataBytes)
-						if err != nil {
-							println(err.Error())
-						}
+					_, err = file.Write(dataBytes)
+					if err != nil {
+						println(err.Error())
 					}
 				}
 			}
@@ -399,6 +412,16 @@ CREATE TABLE "access_tokens" (
 				println("unlocked unlocked")
 			case _ = <-lockoutTimer.C:
 				println("debug: timer expired!")
+
+				payload := UpdateType{
+					Type:        "status",
+					Description: "timerExpired"}
+				payloadStr, err := json.Marshal(payload)
+				if err == nil {
+					activeConnectionMutex.Lock()
+					activeConnection.WriteJSON(string(payloadStr))
+					activeConnectionMutex.Unlock()
+				}
 
 				if readyForQueue.Load() {
 					continue
@@ -485,9 +508,9 @@ CREATE TABLE "access_tokens" (
 
 		authKey, hasAuthKey := r.Header["Authorization"]
 		if !hasAuthKey {
-			payload := ErrorType{
-				Type:             "error",
-				ErrorDescription: "must have Authorization header set"}
+			payload := UpdateType{
+				Type:        "error",
+				Description: "must have Authorization header set"}
 
 			payloadStr, err := json.Marshal(payload)
 			if err != nil {
@@ -500,9 +523,9 @@ CREATE TABLE "access_tokens" (
 
 		tx, err := db.Begin()
 		if err != nil {
-			payload := ErrorType{
-				Type:             "error",
-				ErrorDescription: err.Error()}
+			payload := UpdateType{
+				Type:        "error",
+				Description: err.Error()}
 
 			payloadStr, err := json.Marshal(payload)
 			if err != nil {
@@ -515,9 +538,9 @@ CREATE TABLE "access_tokens" (
 
 		stmt, err := tx.Prepare(`SELECT access_key, auth_type, name, time_created FROM "access_tokens" WHERE access_key = ?`)
 		if err != nil {
-			payload := ErrorType{
-				Type:             "error",
-				ErrorDescription: err.Error()}
+			payload := UpdateType{
+				Type:        "error",
+				Description: err.Error()}
 
 			payloadStr, err := json.Marshal(payload)
 			if err != nil {
@@ -537,9 +560,9 @@ CREATE TABLE "access_tokens" (
 		err = row.Scan(&returnInfo.AccessKey, &returnInfo.AuthType, &returnInfo.Name, &returnInfo.TimeCreated)
 
 		if err != nil {
-			payload := ErrorType{
-				Type:             "error",
-				ErrorDescription: err.Error()}
+			payload := UpdateType{
+				Type:        "error",
+				Description: err.Error()}
 
 			payloadStr, err := json.Marshal(payload)
 			if err != nil {
@@ -565,9 +588,9 @@ CREATE TABLE "access_tokens" (
 
 		err = json.Unmarshal([]byte(readStructureStr), &readStructure)
 		if err != nil {
-			payload := ErrorType{
-				Type:             "error",
-				ErrorDescription: "unmarshal error on servers fault"}
+			payload := UpdateType{
+				Type:        "error",
+				Description: "unmarshal error on servers fault"}
 
 			payloadStr, err := json.Marshal(payload)
 			if err != nil {
@@ -580,9 +603,9 @@ CREATE TABLE "access_tokens" (
 
 		messageType, hasType := readStructure["type"]
 		if !hasType {
-			payload := ErrorType{
-				Type:             "error",
-				ErrorDescription: "type parsing error, server sent invalid packet"}
+			payload := UpdateType{
+				Type:        "error",
+				Description: "type parsing error, server sent invalid packet"}
 
 			c.WriteJSON(payload)
 			c.Close()
@@ -590,9 +613,9 @@ CREATE TABLE "access_tokens" (
 		}
 
 		if messageType != "upload" {
-			payload := ErrorType{
-				Type:             "error",
-				ErrorDescription: "first packet must be error"}
+			payload := UpdateType{
+				Type:        "error",
+				Description: "first packet must be error"}
 
 			payloadStr, err := json.Marshal(payload)
 			if err != nil {
@@ -605,9 +628,9 @@ CREATE TABLE "access_tokens" (
 
 		messageFile, hasFile := readStructure["file"]
 		if !hasFile {
-			payload := ErrorType{
-				Type:             "error",
-				ErrorDescription: "you must upload a file"}
+			payload := UpdateType{
+				Type:        "error",
+				Description: "you must upload a file"}
 
 			payloadStr, err := json.Marshal(payload)
 			if err != nil {
@@ -619,9 +642,9 @@ CREATE TABLE "access_tokens" (
 		}
 
 		if len(messageFile.(string)) > 1000000 /* 1mb */ {
-			payload := ErrorType{
-				Type:             "error",
-				ErrorDescription: "file content must be smaller than 1mb"}
+			payload := UpdateType{
+				Type:        "error",
+				Description: "file content must be smaller than 1mb"}
 
 			payloadStr, err := json.Marshal(payload)
 			if err != nil {
@@ -716,13 +739,10 @@ CREATE TABLE "access_tokens" (
 	http.HandleFunc("/api/v1/get_info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Content-Type", "application/json")
 
-		type ErrorType struct {
-			ErrorDescription string `json:"error_description"`
-		}
-
 		if r.Method != "GET" {
-			payload := ErrorType{
-				ErrorDescription: "must be a GET"}
+			payload := UpdateType{
+				Type:        "error",
+				Description: "must be a GET"}
 			payloadStr, _ := json.Marshal(payload)
 
 			w.Write(payloadStr)
@@ -731,8 +751,9 @@ CREATE TABLE "access_tokens" (
 
 		authKey, hasAuthKey := r.Header["Authorization"]
 		if !hasAuthKey {
-			payload := ErrorType{
-				ErrorDescription: "must have Authorization header set"}
+			payload := UpdateType{
+				Type:        "error",
+				Description: "must have Authorization header set"}
 			payloadStr, _ := json.Marshal(payload)
 
 			w.Write(payloadStr)
@@ -741,8 +762,9 @@ CREATE TABLE "access_tokens" (
 
 		tx, err := db.Begin()
 		if err != nil {
-			payload := ErrorType{
-				ErrorDescription: err.Error()}
+			payload := UpdateType{
+				Type:        "error",
+				Description: err.Error()}
 			payloadStr, _ := json.Marshal(payload)
 
 			w.Write(payloadStr)
@@ -751,8 +773,9 @@ CREATE TABLE "access_tokens" (
 
 		stmt, err := tx.Prepare(`SELECT access_key, auth_type, name, time_created FROM "access_tokens" WHERE access_key = ?`)
 		if err != nil {
-			payload := ErrorType{
-				ErrorDescription: err.Error()}
+			payload := UpdateType{
+				Type:        "error",
+				Description: err.Error()}
 			payloadStr, _ := json.Marshal(payload)
 
 			w.Write(payloadStr)
@@ -768,8 +791,9 @@ CREATE TABLE "access_tokens" (
 		err = row.Scan(&returnInfo.AccessKey, &returnInfo.AuthType, &returnInfo.Name, &returnInfo.TimeCreated)
 
 		if err != nil {
-			payload := ErrorType{
-				ErrorDescription: err.Error()}
+			payload := UpdateType{
+				Type:        "error",
+				Description: err.Error()}
 			payloadStr, _ := json.Marshal(payload)
 
 			w.Write(payloadStr)
