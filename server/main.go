@@ -27,7 +27,7 @@ import (
 )
 
 func getTTY(mode *serial.Mode) (serial.Port, error) {
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 500; i++ {
 		nameTTY := fmt.Sprintf("/dev/ttyUSB%v", i)
 
 		file, err := serial.Open(nameTTY, mode)
@@ -311,7 +311,6 @@ CREATE TABLE "access_tokens" (
 				}
 
 				file, err := getTTY(mode)
-				defer file.Close()
 				if err != nil {
 					payload := UpdateType{
 						Type:        "error",
@@ -325,6 +324,12 @@ CREATE TABLE "access_tokens" (
 					finishActiveConnection <- true
 					continue
 				}
+
+				defer func() {
+					if file != nil {
+						file.Close()
+					}
+				}()
 
 				serialStream <- file
 

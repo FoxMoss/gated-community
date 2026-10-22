@@ -10,13 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"time"
 
 	"os/exec"
 	"runtime"
 
 	"github.com/alecthomas/kong"
-	"github.com/creack/pty"
+	"github.com/containerd/console"
 	"github.com/gorilla/websocket"
 	"github.com/spf13/viper"
 
@@ -132,25 +131,22 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 		return err
 	}
 
-	term, _, err := pty.Open()
+	consoleInterface, slave, err := console.NewPty()
 	if err != nil {
 		m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
 		return err
 	}
 
-	defer term.Close()
-
-	// don't timeout
-	term.SetDeadline(time.Time{})
+	defer consoleInterface.Close()
 
 	go func() {
 		buffer := make([]byte, 1024)
 		for {
-			bufferLen, err := term.Read(buffer)
+			bufferLen, err := consoleInterface.Read(buffer)
 
 			if err != nil {
-				m.stateChan <- UIState{status: "error", errorMessage: "error reading pty\n" + err.Error()}
-				break
+				m.stateChan <- UIState{status: "warning", errorMessage: "error reading pty\n" + err.Error()}
+				continue
 			}
 
 			returnArray := make([]int, bufferLen)
@@ -221,7 +217,7 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 		case "status":
 			description, hasDescription := readStructure["description"]
 			if hasDescription {
-				m.stateChan <- UIState{status: description.(string), ptyName: term.Name()}
+				m.stateChan <- UIState{status: description.(string), ptyName: slave}
 				break
 			}
 		case "egress":
@@ -236,9 +232,9 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 				dataBytes[item] = byte(data.([]any)[item].(float64))
 			}
 
-			_, err = term.Write(dataBytes)
+			_, err = consoleInterface.Write(dataBytes)
 			if err != nil {
-				m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
+				m.stateChan <- UIState{status: "warn", errorMessage: err.Error()}
 			}
 
 		default:
