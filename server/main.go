@@ -25,7 +25,15 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
 	"go.bug.st/serial"
+
+	_ "embed"
 )
+
+//go:embed index.html
+var landingPage []byte
+
+//go:embed auth.html
+var authPage string
 
 func getTTY(mode *serial.Mode) (serial.Port, error) {
 	for i := 0; i < 500; i++ {
@@ -689,6 +697,12 @@ CREATE TABLE "access_tokens" (
 		// websocketChanel <- WebsocketMessage{Socket: c, State: WebsocketDisconnect}
 	})
 
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+
+		w.Header().Add("Content-Type", "text/html")
+		w.Write(landingPage)
+	})
+
 	http.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			fmt.Fprintf(w, "error: must be GET")
@@ -750,7 +764,8 @@ CREATE TABLE "access_tokens" (
 			return
 		}
 
-		fmt.Fprintf(w, "Run `gated-community set-key %q`", userIdSum)
+		w.Header().Add("Content-Type", "text/html")
+		w.Write([]byte(fmt.Sprintf(authPage, fmt.Sprintf("gated-community set-key %q", userIdSum))))
 	})
 
 	http.HandleFunc("/api/v1/get_info", func(w http.ResponseWriter, r *http.Request) {
@@ -824,7 +839,7 @@ CREATE TABLE "access_tokens" (
 	})
 
 	s := &http.Server{
-		Addr:           ":8080",
+		Addr:           ":80",
 		Handler:        http.DefaultServeMux,
 		ReadTimeout:    10 * time.Second,
 		WriteTimeout:   10 * time.Second,

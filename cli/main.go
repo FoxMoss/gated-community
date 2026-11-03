@@ -43,7 +43,7 @@ func OpenInBrowser(url string) error {
 func GetInfo(accessKey string) (map[string]any, error) {
 	client := &http.Client{}
 
-	request, err := http.NewRequest(http.MethodGet, "http://localhost:8080/api/v1/get_info", nil)
+	request, err := http.NewRequest(http.MethodGet, "https://gated-community.foxmoss.com/api/v1/get_info", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +100,7 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 		return err
 	}
 
-	url := url.URL{Scheme: "ws", Host: "127.0.0.1:8080", Path: "/queue"}
+	url := url.URL{Scheme: "ws", Host: "gated-community.foxmoss.com", Path: "/queue"}
 
 	requestHeader := http.Header{}
 	requestHeader.Add("Authorization", fmt.Sprintf("%v", authKey))
@@ -307,7 +307,7 @@ func (r *HCACmd) Run(ctx *Context) error {
 	stdinBuffer := []byte{0}
 	os.Stdin.Read(stdinBuffer)
 
-	OpenInBrowser("https://auth.hackclub.com/oauth/authorize?client_id=55e72dce07e7645a7d66e11a8b18a88d&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth&response_type=code&scope=openid+email+name+profile+birthdate+verification_status+slack_id+basic_info")
+	OpenInBrowser("https://auth.hackclub.com/oauth/authorize?client_id=55e72dce07e7645a7d66e11a8b18a88d&redirect_uri=https%3A%2F%2Fgated-community.foxmoss.com%2Fauth&response_type=code&scope=openid+email+name+profile+birthdate+verification_status+slack_id+basic_info")
 
 	println("Opened!")
 

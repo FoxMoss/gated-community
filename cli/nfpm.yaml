@@ -1,0 +1,33 @@
+# This is an example nfpm configuration file.
+# Make sure to check the documentation at https://nfpm.goreleaser.com
+#
+# The lines below are called `modelines`. See `:help modeline`
+# Feel free to remove those if you don't want/need to use them.
+# yaml-language-server: $schema=https://nfpm.goreleaser.com/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+
+name: "gated-community"
+arch: "amd64"
+platform: "linux"
+version: "0.0.1"
+section: "default"
+priority: "extra"
+replaces:
+provides:
+  - gated-community
+depends:
+recommends:
+suggests:
+conflicts:
+maintainer: "Fox Ellison-Taylor <fox.ellisontaylor@gmail.com>"
+description: |
+  A CLI for flashing FPGAs remotely.
+vendor: "FoxMoss"
+homepage: "https://foxmoss.com"
+license: "MIT"
+contents:
+  - src: ./gated-community
+    dst: /usr/bin/gated-community
+  - src: /usr/bin/gated-community
+    dst: /sbin/gated-community
+    type: symlink
