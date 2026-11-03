@@ -1,17 +1,25 @@
 package main
 
 import (
+	_ "embed"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/gen2brain/beeep"
 )
+
+//go:embed logo.png
+var icon []byte
 
 type model struct {
 	stateChan    chan UIState
 	currentState UIState
 	tickInc      uint32
+	timeStarted  time.Time
 }
+
+const timerLength = time.Minute * 10
 
 func (m model) listenForUpdate() tea.Cmd {
 	return func() tea.Msg {
@@ -51,6 +59,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Tick(time.Second, func(t time.Time) tea.Msg {
 				return tea.Quit()
 			})
+		} else if m.currentState.status == "flashing" {
+			m.timeStarted = time.Now()
+
+		} else if m.currentState.status == "flashSuccess" {
+
+			// ignore error
+			_ = beeep.Notify("Flash success!", lipgloss.Sprintf("UART forwarding to %s", m.currentState.ptyName), icon)
+
 		}
 
 		return m, m.listenForUpdate()
@@ -85,6 +101,8 @@ func (m model) View() tea.View {
 		s += "\n"
 		s += lipgloss.Sprintf(errorBody)
 		s += "\n"
+	case "warning":
+		fallthrough
 	case "flashSuccess":
 		check := lipgloss.NewStyle().
 			Background(lipgloss.Color("#a6e3a1")).
@@ -105,13 +123,29 @@ func (m model) View() tea.View {
 
 		s += "\n"
 
-		active := lipgloss.NewStyle().
-			Background(lipgloss.Color("#b4befe")).
-			Foreground(lipgloss.Color("#11111b"))
+		timeLeft := timerLength - time.Now().Sub(m.timeStarted)
 
-		spinner := []string{".  ", ".. ", "...", " ..", "  .", "   "}
-		s += lipgloss.Sprintf(active.Render("", spinner[m.tickInc%uint32(len(spinner))], ""))
-		s += lipgloss.Sprintf(text.Render(" forwarding data \n"))
+		if timeLeft > 0 {
+			s += lipgloss.Sprintf("time remaining: %02v:%02v", int32(timeLeft.Minutes()), int32(timeLeft.Seconds())%60)
+		} else {
+			timeLeft = timeLeft.Abs()
+			s += lipgloss.Sprintf("overtime lasted for: %02v:%02v", int32(timeLeft.Minutes()), int32(timeLeft.Seconds())%60)
+		}
+
+		if m.currentState.status == "warning" {
+
+			s += "\n"
+
+			info := lipgloss.NewStyle().
+				Background(lipgloss.Color("#f9e2af")).
+				Foreground(lipgloss.Color("#11111b"))
+
+			s += lipgloss.Sprintf(info.Render(" !!! "))
+			s += lipgloss.Sprintf(" warning: %s", m.currentState.errorMessage)
+		}
+
+		s += "\n"
+
 	case "flashing":
 		load := lipgloss.NewStyle().
 			Background(lipgloss.Color("#f9e2af")).
@@ -121,6 +155,41 @@ func (m model) View() tea.View {
 		spinner := []string{"-", "\\", "|", "/"}
 		s += lipgloss.Sprintf(load.Render(" ", spinner[m.tickInc%uint32(len(spinner))], " "))
 		s += lipgloss.Sprintf(text.Render(" flashing bitstream "))
+	case "timerExpired":
+		check := lipgloss.NewStyle().
+			Background(lipgloss.Color("#a6e3a1")).
+			Foreground(lipgloss.Color("#11111b"))
+		text := lipgloss.NewStyle()
+
+		s += lipgloss.Sprintf(check.Render(" :-) "))
+		s += lipgloss.Sprintf(text.Render(" flashed bitstream "))
+
+		s += "\n"
+
+		info := lipgloss.NewStyle().
+			Background(lipgloss.Color("#94e2d5")).
+			Foreground(lipgloss.Color("#11111b"))
+
+		s += lipgloss.Sprintf(info.Render(" !!! "))
+		s += lipgloss.Sprintf(" FPGA uart forwarded to %s", m.currentState.ptyName)
+
+		s += "\n"
+
+		s += lipgloss.Sprintf(check.Render(" :-) "))
+		s += lipgloss.Sprintf(text.Render(" connection succesfully expired"))
+
+		s += "\n"
+
+	case "waiting":
+		container := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#fff")).
+			Background(lipgloss.Color("#11111b"))
+
+		spinner := []string{"...", " ..", "  .", "   ", ".  ", ".. "}
+		s += lipgloss.Sprintf(container.Render("waiting%s currently #%d out of %d"), spinner[m.tickInc%uint32(len(spinner))], m.currentState.currentPlace, m.currentState.connectedClients)
+
+		s += "\n"
+
 	default:
 		s += m.currentState.status
 	}

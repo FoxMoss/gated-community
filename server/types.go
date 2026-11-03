@@ -1,6 +1,10 @@
 package main
 
-import "github.com/gorilla/websocket"
+import (
+	"time"
+
+	"github.com/gorilla/websocket"
+)
 
 type OAuthToken struct {
 	ClientId     string `json:"client_id"`
@@ -25,6 +29,7 @@ type UpdateType struct {
 type QueueBroadcastType struct {
 	Type             string `json:"type"`
 	ConnectedClients uint64 `json:"connected_clients"`
+	CurrentPlace     uint64 `json:"current_place"`
 	IsProccessing    bool   `json:"is_proccessing"`
 }
 
@@ -38,3 +43,5 @@ type FileCacheMessage struct {
 	Connection *websocket.Conn
 	File       []byte
 }
+
+const timerLength = time.Minute * 10

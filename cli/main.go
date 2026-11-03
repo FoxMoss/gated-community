@@ -85,15 +85,18 @@ type UploadCmd struct {
 }
 
 type UIState struct {
-	status       string
-	errorMessage string
-	ptyName      string
+	status           string
+	errorMessage     string
+	ptyName          string
+	currentPlace     uint64
+	connectedClients uint64
 }
 
 func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 	fileBuffer, err := os.ReadFile(r.Path)
 
 	if err != nil {
+		m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
 		return err
 	}
 
@@ -104,10 +107,27 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 
 	c, _, err := websocket.DefaultDialer.Dial(url.String(), requestHeader)
 	if err != nil {
-		log.Fatal(err)
+		m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
+		return err
 	}
 
-	defer c.Close()
+	defer func() {
+		type CloseType struct {
+			Type        string `json:"type"`
+			Description string `json:"description"`
+		}
+
+		payload := CloseType{
+			Type:        "close",
+			Description: "client closing gracefully"}
+
+		payloadStr, err := json.Marshal(payload)
+		if err != nil {
+			c.WriteJSON(string(payloadStr))
+		}
+
+		c.Close()
+	}()
 
 	type UploadType struct {
 		Type string `json:"type"`
@@ -122,12 +142,14 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 	uploadBuffer, err := json.Marshal(fileUpload)
 
 	if err != nil {
+		m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
 		return err
 	}
 
 	err = c.WriteJSON(string(uploadBuffer))
 
 	if err != nil {
+		m.stateChan <- UIState{status: "error", errorMessage: err.Error()}
 		return err
 	}
 
@@ -218,6 +240,14 @@ func (m model) QueueConnection(r *UploadCmd, authKey string) error {
 			description, hasDescription := readStructure["description"]
 			if hasDescription {
 				m.stateChan <- UIState{status: description.(string), ptyName: slave}
+				break
+			}
+		case "queue_broadcast":
+			connectedClients, hasConnectedClients := readStructure["connected_clients"]
+			currentPlace, hasCurrentPlace := readStructure["current_place"]
+
+			if hasConnectedClients && hasCurrentPlace {
+				m.stateChan <- UIState{status: "waiting", connectedClients: uint64(connectedClients.(float64)), currentPlace: uint64(currentPlace.(float64))}
 				break
 			}
 		case "egress":

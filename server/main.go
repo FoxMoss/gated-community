@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -238,9 +239,9 @@ CREATE TABLE "access_tokens" (
 		}
 	}()
 
-	activeChannel := make(chan WebsocketMessage, 0)
+	activeChannel := make(chan WebsocketMessage, 10)
 	websocketChannel := make(chan WebsocketMessage, 10)
-	finishActiveConnection := make(chan bool, 0)
+	finishActiveConnection := make(chan bool, 10)
 
 	fileDB := map[*websocket.Conn][]byte{}
 	fileDBMutex := sync.Mutex{}
@@ -387,17 +388,19 @@ CREATE TABLE "access_tokens" (
 	// queue handler
 	go func() {
 		websocketQueue := []*websocket.Conn{}
-		websocketStatuses := map[*websocket.Conn]bool{}
+		websocketStatuses := map[*websocket.Conn]uint32{}
 
-		lockoutTimer := time.NewTimer(time.Second * 60 * 5)
+		lockoutTimer := time.NewTimer(timerLength)
 		lockoutTimer.Stop()
 
-		var connectedCount uint64 = 0
+		var rollingId uint32 = 0
+
 		for {
 
 			println("waiting again connection")
 			select {
 			case _ = <-finishActiveConnection:
+
 				println("removing connection")
 				lockoutTimer.Stop()
 
@@ -406,11 +409,18 @@ CREATE TABLE "access_tokens" (
 				println("waiting on lock")
 				activeConnectionMutex.Lock()
 
-				if activeConnection != nil {
-					activeConnection.Close()
+				payload := UpdateType{
+					Type:        "status",
+					Description: "timerExpired"}
+				payloadStr, err := json.Marshal(payload)
+				if err == nil && activeConnection != nil {
+					activeConnection.WriteJSON(string(payloadStr))
 				}
 
-				websocketChannel <- WebsocketMessage{Socket: activeConnection, State: WebsocketDisconnect}
+				if activeConnection != nil {
+					activeConnection.Close()
+					websocketChannel <- WebsocketMessage{Socket: activeConnection, State: WebsocketDisconnect}
+				}
 
 				activeConnection = nil
 				activeConnectionMutex.Unlock()
@@ -418,21 +428,11 @@ CREATE TABLE "access_tokens" (
 			case _ = <-lockoutTimer.C:
 				println("debug: timer expired!")
 
-				payload := UpdateType{
-					Type:        "status",
-					Description: "timerExpired"}
-				payloadStr, err := json.Marshal(payload)
-				if err == nil {
-					activeConnectionMutex.Lock()
-					activeConnection.WriteJSON(string(payloadStr))
-					activeConnectionMutex.Unlock()
-				}
-
 				if readyForQueue.Load() {
 					continue
 				}
 
-				if len(websocketQueue) <= 1 {
+				if len(websocketQueue) > 1 {
 					finishActiveConnection <- true
 					continue
 				}
@@ -443,12 +443,11 @@ CREATE TABLE "access_tokens" (
 				println("new update msg")
 				switch websocketUpdate.State {
 				case WebsocketConnect:
-					websocketStatuses[websocketUpdate.Socket] = true
+					websocketStatuses[websocketUpdate.Socket] = rollingId
+					rollingId++
 					websocketQueue = append(websocketQueue, websocketUpdate.Socket)
 
-					connectedCount++
 				case WebsocketDisconnect:
-					connectedCount--
 
 					removeIndex := slices.IndexFunc(websocketQueue, func(conn *websocket.Conn) bool { return websocketUpdate.Socket == conn })
 					if removeIndex != -1 {
@@ -457,31 +456,44 @@ CREATE TABLE "access_tokens" (
 					}
 				}
 
+				websocketStatusesKeys := make([]*websocket.Conn, 0, len(websocketStatuses))
+				for c := range websocketStatuses {
+					websocketStatusesKeys = append(websocketStatusesKeys, c)
+				}
+				sort.Slice(websocketStatusesKeys, func(i, j int) bool {
+					return websocketStatuses[websocketStatusesKeys[i]] < websocketStatuses[websocketStatusesKeys[j]]
+				})
+
 				var first *websocket.Conn = nil
 				if len(websocketQueue) != 0 {
-					first = websocketQueue[0]
+					first = websocketStatusesKeys[0]
 				}
 
-				for connection := range websocketStatuses {
-					broadcastMessage := QueueBroadcastType{
-						Type:             "queue_broadcast",
-						ConnectedClients: connectedCount,
-						IsProccessing:    connection == first,
+				for connectionInt := range websocketStatusesKeys {
+					connection := websocketStatusesKeys[connectionInt]
+					if connectionInt != 0 {
+						broadcastMessage := QueueBroadcastType{
+							Type:             "queue_broadcast",
+							ConnectedClients: uint64(len(websocketStatuses)),
+							CurrentPlace:     uint64(connectionInt),
+							IsProccessing:    connection == first,
+						}
+
+						broadcastMarshalled, err := json.Marshal(broadcastMessage)
+						if err != nil {
+							fmt.Println("error: ", err.Error())
+							continue
+						}
+						err = connection.WriteJSON(string(broadcastMarshalled))
+						if err != nil {
+							connection.Close()
+
+							websocketChannel <- WebsocketMessage{Socket: connection, State: WebsocketDisconnect}
+
+							continue
+						}
 					}
 
-					broadcastMarshalled, err := json.Marshal(broadcastMessage)
-					if err != nil {
-						fmt.Println("error: ", err.Error())
-						continue
-					}
-					err = connection.WriteJSON(string(broadcastMarshalled))
-
-					if err != nil {
-						connection.Close()
-
-						websocketChannel <- WebsocketMessage{Socket: connection, State: WebsocketDisconnect}
-						continue
-					}
 				}
 
 				if timerExpired.Load() && len(websocketQueue) > 1 && !readyForQueue.Load() {
@@ -493,7 +505,7 @@ CREATE TABLE "access_tokens" (
 					activeChannel <- WebsocketMessage{Socket: first, State: WebsocketConnect}
 					readyForQueue.Store(false)
 
-					lockoutTimer.Reset(time.Second * 60 * 5)
+					lockoutTimer.Reset(timerLength)
 					println("debug: started timer")
 				}
 			}
